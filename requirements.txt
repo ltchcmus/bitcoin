@@ -1,0 +1,17 @@
+numpy>=1.26.4
+pandas>=2.2.2
+polars>=1.8.2
+pyarrow>=17.0.0
+requests>=2.32.3
+websocket-client>=1.8.0
+scikit-learn>=1.5.1
+xgboost>=2.1.1
+joblib>=1.4.2
+shap>=0.46.0
+optuna>=3.6.1
+torch>=2.4.1
+vectorbt>=0.26.2
+backtrader>=1.9.78.123
+redis>=5.1.1
+confluent-kafka>=2.5.3
+python-binance>=1.0.19
