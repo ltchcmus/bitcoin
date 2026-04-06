@@ -90,6 +90,7 @@ def train_transformer(
     seq_len: int = 120,
     epochs: int = 12,
     batch_size: int = 256,
+    test_batch_size: int = 512,
     learning_rate: float = 1e-3,
     use_gpu: bool = False,
     verbose: bool = False,
@@ -214,11 +215,65 @@ def train_transformer(
 
     test_probs = np.empty((0, 3), dtype=np.float32)
     if len(test_x) > 0:
-        with torch.no_grad():
-            tx = torch.tensor(test_x).to(device)
-            logits = model(tx)
-            probs = F.softmax(logits, dim=1).detach().cpu().numpy().astype(np.float32)
-            test_probs = probs
+        infer_device = device
+
+        def _batched_predict_probs(
+            infer_model: SequenceTransformer,
+            x_arr: np.ndarray,
+            device_obj: torch.device,
+            chunk_size: int,
+        ) -> np.ndarray:
+            out_parts = []
+            chunk_size = max(int(chunk_size), 1)
+            with torch.no_grad():
+                for i in range(0, len(x_arr), chunk_size):
+                    xb = torch.from_numpy(x_arr[i : i + chunk_size]).to(device_obj)
+                    logits = infer_model(xb)
+                    probs = (
+                        F.softmax(logits, dim=1)
+                        .detach()
+                        .cpu()
+                        .numpy()
+                        .astype(np.float32)
+                    )
+                    out_parts.append(probs)
+            return (
+                np.concatenate(out_parts, axis=0)
+                if out_parts
+                else np.empty((0, 3), dtype=np.float32)
+            )
+
+        try:
+            test_probs = _batched_predict_probs(
+                model,
+                test_x,
+                infer_device,
+                test_batch_size,
+            )
+        except torch.OutOfMemoryError:
+            if infer_device.type != "cuda":
+                raise
+            if verbose:
+                print("[train] Transformer test inference OOM on GPU, fallback to CPU")
+            torch.cuda.empty_cache()
+            infer_device = torch.device("cpu")
+            model_cpu = SequenceTransformer(
+                n_features=n_features,
+                seq_len=seq_len,
+                d_model=64,
+                nhead=4,
+                num_layers=2,
+                dropout=0.1,
+                num_classes=3,
+            ).to(infer_device)
+            model_cpu.load_state_dict(best_state)
+            model_cpu.eval()
+            test_probs = _batched_predict_probs(
+                model_cpu,
+                test_x,
+                infer_device,
+                test_batch_size,
+            )
 
     payload = {
         "state_dict": best_state,
@@ -236,6 +291,7 @@ def train_transformer(
         "seq_len": seq_len,
         "epochs": epochs,
         "batch_size": batch_size,
+        "test_batch_size": test_batch_size,
         "learning_rate": learning_rate,
         "device": device.type,
     }
