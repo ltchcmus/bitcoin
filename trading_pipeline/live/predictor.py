@@ -2,7 +2,7 @@ import json
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import joblib
 import numpy as np
@@ -25,6 +25,7 @@ class LiveConfig:
     model_path: str
     symbol: str
     bootstrap_bars: int = 1500
+    force_continuous_trade: Optional[bool] = None
 
 
 class LivePredictor:
@@ -32,6 +33,11 @@ class LivePredictor:
         artifact = joblib.load(cfg.model_path)
         runtime_cfg = artifact.get("runtime", {})
         self.use_gpu = bool(runtime_cfg.get("use_gpu", False))
+        runtime_force = bool(runtime_cfg.get("force_continuous_trade", False))
+        if cfg.force_continuous_trade is None:
+            self.force_continuous_trade = runtime_force
+        else:
+            self.force_continuous_trade = bool(cfg.force_continuous_trade)
         if "models" in artifact:
             self.model = artifact["models"]["xgb"]
             self.transformer_payload = artifact["models"].get("transformer")
@@ -49,6 +55,18 @@ class LivePredictor:
         self.confidence = float(artifact["confidence_threshold"])
         self.symbol = cfg.symbol.upper()
         self.bootstrap_bars = cfg.bootstrap_bars
+        futures_cols = {
+            "funding_rate",
+            "open_interest",
+            "oi_change_5m",
+            "open_interest_value",
+            "oi_value_change_5m",
+            "taker_buy_sell_ratio",
+            "futures_aggr_pressure",
+        }
+        depth_cols = {"spread_bps", "depth_imbalance_10", "depth_imbalance_20"}
+        self.need_futures_features = any(c in self.feature_cols for c in futures_cols)
+        self.need_depth_features = any(c in self.feature_cols for c in depth_cols)
         self.buffer = pd.DataFrame()
         self.pending_trades: List[Dict] = []
 
@@ -116,27 +134,36 @@ class LivePredictor:
 
     def _predict_latest(self) -> None:
         source_df = self.buffer.copy()
-        try:
-            source_df, _ = enrich_bars_with_futures_features(
-                source_df, symbol=self.symbol, period="5m"
-            )
-        except Exception:
-            pass
+        if self.need_futures_features:
+            try:
+                source_df, _ = enrich_bars_with_futures_features(
+                    source_df, symbol=self.symbol, period="5m"
+                )
+            except Exception:
+                pass
 
-        try:
-            depth_snapshot = fetch_depth_snapshot_features(
-                symbol=self.symbol, limit=100
-            )
-            for key, value in depth_snapshot.items():
-                source_df[key] = value
-        except Exception:
-            pass
+        if self.need_depth_features:
+            try:
+                depth_snapshot = fetch_depth_snapshot_features(
+                    symbol=self.symbol, limit=100
+                )
+                for key, value in depth_snapshot.items():
+                    source_df[key] = value
+            except Exception:
+                pass
 
         feature_df = add_features(source_df)
         latest = feature_df.iloc[-1]
         x_live = pd.Series({col: latest.get(col, np.nan) for col in self.feature_cols})
         if x_live.isna().any():
             return
+
+        try:
+            xgb_params = self.model.get_xgb_params()
+            if str(xgb_params.get("device", "")).startswith("cuda"):
+                self.model.set_params(device="cpu")
+        except Exception:
+            pass
 
         probs_xgb = self.model.predict_proba(x_live.to_numpy().reshape(1, -1))[0]
         probs_tf = None
@@ -162,10 +189,16 @@ class LivePredictor:
             probs = probs_xgb
             is_agree = True
 
-        direction = int(np.array([-1, 0, 1])[int(np.argmax(probs))])
-        confidence = float(np.max(probs))
-        is_confirmed = is_agree or (not self.require_model_agreement)
-        action = direction if confidence >= self.confidence and is_confirmed else 0
+        if self.force_continuous_trade:
+            direction = int(1 if probs[2] >= probs[0] else -1)
+            confidence = float(max(probs[0], probs[2]))
+            is_confirmed = True
+            action = direction
+        else:
+            direction = int(np.array([-1, 0, 1])[int(np.argmax(probs))])
+            confidence = float(np.max(probs))
+            is_confirmed = is_agree or (not self.require_model_agreement)
+            action = direction if confidence >= self.confidence and is_confirmed else 0
 
         stamp = str(latest["close_time"])
         print(

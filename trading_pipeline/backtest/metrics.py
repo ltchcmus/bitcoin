@@ -12,13 +12,18 @@ def run_backtest(
     confidence_threshold: float,
     fee_per_trade: float,
     confirmation_mask: np.ndarray | None = None,
+    force_continuous_trade: bool = False,
 ) -> Dict[str, float]:
     class_idx = np.argmax(probs, axis=1)
     max_prob = np.max(probs, axis=1)
     raw_signal = np.array([-1, 0, 1])[class_idx]
-    signal = np.where(max_prob >= confidence_threshold, raw_signal, 0)
-    if confirmation_mask is not None:
-        signal = np.where(confirmation_mask, signal, 0)
+    if force_continuous_trade:
+        # Always choose a side from directional probabilities, never hold.
+        signal = np.where(probs[:, 2] >= probs[:, 0], 1, -1)
+    else:
+        signal = np.where(max_prob >= confidence_threshold, raw_signal, 0)
+        if confirmation_mask is not None:
+            signal = np.where(confirmation_mask, signal, 0)
 
     pnl = signal * future_returns.to_numpy()
     cost = (signal != 0).astype(float) * fee_per_trade

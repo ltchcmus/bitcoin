@@ -5,8 +5,10 @@ from trading_pipeline.config import (
     DEFAULT_ENSEMBLE_WEIGHT_XGB,
     DEFAULT_ENABLE_DEPTH_FEATURES,
     DEFAULT_ENABLE_FUTURES_FEATURES,
+    DEFAULT_FORCE_CONTINUOUS_TRADE,
     DEFAULT_LOOKBACK_DAYS,
     DEFAULT_MODEL_FILENAME,
+    DEFAULT_PREDICT_LOOKBACK_MINUTES,
     DEFAULT_OPTUNA_STORAGE,
     DEFAULT_OPTUNA_STUDY_NAME,
     DEFAULT_REQUIRE_MODEL_AGREEMENT,
@@ -65,6 +67,7 @@ def command_train(args: argparse.Namespace) -> None:
         transformer_epochs=args.transformer_epochs,
         ensemble_weight_xgb=args.ensemble_weight_xgb,
         require_model_agreement=args.require_model_agreement,
+        force_continuous_trade=args.force_continuous_trade,
         verbose=True,
     )
     print("Classification report (test):")
@@ -107,6 +110,7 @@ def command_upgrade(args: argparse.Namespace) -> None:
         transformer_epochs=args.transformer_epochs,
         ensemble_weight_xgb=args.ensemble_weight_xgb,
         require_model_agreement=args.require_model_agreement,
+        force_continuous_trade=args.force_continuous_trade,
         verbose=True,
     )
     update = details["update"]
@@ -139,34 +143,16 @@ def command_predict(args: argparse.Namespace) -> None:
         include_futures_features=args.include_futures_features,
         include_depth_features=args.include_depth_features,
         use_gpu=args.use_gpu,
+        force_continuous_trade=args.force_continuous_trade,
     )
-    print(f"timestamp={result['timestamp']} close={result['close']:.2f}")
+    side = (
+        "BUY" if result["action"] > 0 else ("SELL" if result["action"] < 0 else "HOLD")
+    )
+    side_prob = max(float(result["prob_up"]), float(result["prob_down"]))
     print(
-        "probs: "
-        f"down={result['prob_down']:.3f} flat={result['prob_flat']:.3f} up={result['prob_up']:.3f}"
+        f"signal={side} probability={side_prob*100:.2f}% "
+        f"price={result['close']:.2f} ts={result['timestamp']}"
     )
-    print(
-        f"direction={result['direction']} confidence={result['confidence']:.3f} action={result['action']}"
-    )
-    print(f"is_confirmed={result['is_confirmed']}")
-    print(f"prob_xgb={result['prob_xgb']}")
-    if result.get("prob_transformer") is not None:
-        print(f"prob_transformer={result['prob_transformer']}")
-    eval_summary = result.get("eval_summary", {})
-    cls = (
-        eval_summary.get("classification_metrics", {})
-        if isinstance(eval_summary, dict)
-        else {}
-    )
-    if cls:
-        print(
-            "historical_test="
-            f"accuracy={float(cls.get('accuracy', 0.0))*100:.2f}% "
-            f"balanced_accuracy={float(cls.get('balanced_accuracy', 0.0))*100:.2f}% "
-            f"f1_macro={float(cls.get('f1_macro', 0.0))*100:.2f}%"
-        )
-    if result.get("depth_snapshot"):
-        print(f"depth_snapshot={result['depth_snapshot']}")
 
 
 def command_live(args: argparse.Namespace) -> None:
@@ -176,6 +162,7 @@ def command_live(args: argparse.Namespace) -> None:
         model_path=args.model,
         symbol=args.symbol,
         bootstrap_bars=args.bootstrap_bars,
+        force_continuous_trade=args.force_continuous_trade,
     )
     live = LivePredictor(cfg)
     live.run()
@@ -238,6 +225,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_REQUIRE_MODEL_AGREEMENT,
     )
     p_train.add_argument(
+        "--force-continuous-trade",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_FORCE_CONTINUOUS_TRADE,
+    )
+    p_train.add_argument(
         "--include-futures-features",
         action=argparse.BooleanOptionalAction,
         default=DEFAULT_ENABLE_FUTURES_FEATURES,
@@ -285,6 +277,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_REQUIRE_MODEL_AGREEMENT,
     )
     p_upgrade.add_argument(
+        "--force-continuous-trade",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_FORCE_CONTINUOUS_TRADE,
+    )
+    p_upgrade.add_argument(
         "--include-futures-features",
         action=argparse.BooleanOptionalAction,
         default=DEFAULT_ENABLE_FUTURES_FEATURES,
@@ -302,7 +299,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_predict.add_argument("--model", default=DEFAULT_MODEL_FILENAME)
     p_predict.add_argument("--symbol", default=DEFAULT_SYMBOL)
-    p_predict.add_argument("--lookback-minutes", type=int, default=360)
+    p_predict.add_argument(
+        "--lookback-minutes", type=int, default=DEFAULT_PREDICT_LOOKBACK_MINUTES
+    )
     p_predict.add_argument(
         "--include-futures-features",
         action=argparse.BooleanOptionalAction,
@@ -318,6 +317,11 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=DEFAULT_USE_GPU,
     )
+    p_predict.add_argument(
+        "--force-continuous-trade",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     p_predict.set_defaults(func=command_predict)
 
     p_live = subparsers.add_parser(
@@ -326,6 +330,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_live.add_argument("--model", default=DEFAULT_MODEL_FILENAME)
     p_live.add_argument("--symbol", default=DEFAULT_SYMBOL)
     p_live.add_argument("--bootstrap-bars", type=int, default=1500)
+    p_live.add_argument(
+        "--force-continuous-trade",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     p_live.set_defaults(func=command_live)
 
     p_gui = subparsers.add_parser(

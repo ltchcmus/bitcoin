@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta, timezone
-from typing import Dict
+from typing import Dict, Optional
 
 import joblib
 import numpy as np
@@ -20,7 +20,9 @@ from trading_pipeline.config import (
     DEFAULT_ENSEMBLE_WEIGHT_XGB,
     DEFAULT_ENABLE_DEPTH_FEATURES,
     DEFAULT_ENABLE_FUTURES_FEATURES,
+    DEFAULT_FORCE_CONTINUOUS_TRADE,
     DEFAULT_LOOKBACK_DAYS,
+    DEFAULT_PREDICT_LOOKBACK_MINUTES,
     DEFAULT_OPTUNA_STORAGE,
     DEFAULT_OPTUNA_STUDY_NAME,
     DEFAULT_REQUIRE_MODEL_AGREEMENT,
@@ -82,6 +84,7 @@ def train_from_dataframe(
     transformer_epochs: int = DEFAULT_TRANSFORMER_EPOCHS,
     ensemble_weight_xgb: float = DEFAULT_ENSEMBLE_WEIGHT_XGB,
     require_model_agreement: bool = DEFAULT_REQUIRE_MODEL_AGREEMENT,
+    force_continuous_trade: bool = DEFAULT_FORCE_CONTINUOUS_TRADE,
     verbose: bool = False,
 ):
     from trading_pipeline.model.xgb_pipeline import train_xgboost
@@ -180,6 +183,7 @@ def train_from_dataframe(
         confidence_threshold=confidence,
         fee_per_trade=fee,
         confirmation_mask=confirmation_mask,
+        force_continuous_trade=force_continuous_trade,
     )
 
     report = classification_report(y_test_true, y_pred, digits=4, zero_division=0)
@@ -203,6 +207,7 @@ def train_from_dataframe(
         },
         "runtime": {
             "use_gpu": bool(use_gpu),
+            "force_continuous_trade": bool(force_continuous_trade),
         },
         "eval_summary": {
             "classification_metrics": cls_metrics,
@@ -251,6 +256,7 @@ def train_from_dataset(
     transformer_epochs: int = DEFAULT_TRANSFORMER_EPOCHS,
     ensemble_weight_xgb: float = DEFAULT_ENSEMBLE_WEIGHT_XGB,
     require_model_agreement: bool = DEFAULT_REQUIRE_MODEL_AGREEMENT,
+    force_continuous_trade: bool = DEFAULT_FORCE_CONTINUOUS_TRADE,
     verbose: bool = False,
 ) -> Dict:
     if verbose:
@@ -304,6 +310,7 @@ def train_from_dataset(
         transformer_epochs=transformer_epochs,
         ensemble_weight_xgb=ensemble_weight_xgb,
         require_model_agreement=require_model_agreement,
+        force_continuous_trade=force_continuous_trade,
         verbose=verbose,
     )
     if verbose:
@@ -317,14 +324,33 @@ def train_from_dataset(
 def get_latest_feature_vector_and_prediction(
     model_path: str,
     symbol: str = DEFAULT_SYMBOL,
-    lookback_minutes: int = 360,
+    lookback_minutes: int = DEFAULT_PREDICT_LOOKBACK_MINUTES,
     include_futures_features: bool = DEFAULT_ENABLE_FUTURES_FEATURES,
     include_depth_features: bool = DEFAULT_ENABLE_DEPTH_FEATURES,
     use_gpu: bool = DEFAULT_USE_GPU,
+    force_continuous_trade: Optional[bool] = None,
 ) -> Dict:
     artifact = joblib.load(model_path)
     feature_cols = artifact["feature_cols"]
     confidence_threshold = float(artifact["confidence_threshold"])
+    runtime_cfg = artifact.get("runtime", {})
+    if force_continuous_trade is None:
+        force_continuous_trade = bool(runtime_cfg.get("force_continuous_trade", False))
+
+    futures_cols = {
+        "funding_rate",
+        "open_interest",
+        "oi_change_5m",
+        "open_interest_value",
+        "oi_value_change_5m",
+        "taker_buy_sell_ratio",
+        "futures_aggr_pressure",
+    }
+    depth_cols = {"spread_bps", "depth_imbalance_10", "depth_imbalance_20"}
+    need_futures = include_futures_features and any(
+        c in feature_cols for c in futures_cols
+    )
+    need_depth = include_depth_features and any(c in feature_cols for c in depth_cols)
 
     end_time = datetime.now(timezone.utc)
     start_time = end_time - timedelta(minutes=lookback_minutes)
@@ -336,7 +362,7 @@ def get_latest_feature_vector_and_prediction(
     trades_df = agg_trades_to_dataframe(rows)
     bars_df = aggregate_trades_to_30s(trades_df)
 
-    if include_futures_features and not bars_df.empty:
+    if need_futures and not bars_df.empty:
         try:
             bars_df, _ = enrich_bars_with_futures_features(
                 bars_df, symbol=symbol, period="5m"
@@ -345,7 +371,7 @@ def get_latest_feature_vector_and_prediction(
             pass
 
     depth_snapshot = {}
-    if include_depth_features:
+    if need_depth:
         try:
             depth_snapshot = fetch_depth_snapshot_features(symbol=symbol, limit=100)
             for key, value in depth_snapshot.items():
@@ -374,6 +400,14 @@ def get_latest_feature_vector_and_prediction(
         tf_payload = None
         ensemble_cfg = {"weight_xgb": 1.0, "require_model_agreement": False}
 
+    # XGBoost single-row inference is typically faster on CPU and avoids device mismatch warnings.
+    try:
+        xgb_params = xgb_model.get_xgb_params()
+        if str(xgb_params.get("device", "")).startswith("cuda"):
+            xgb_model.set_params(device="cpu")
+    except Exception:
+        pass
+
     probs_xgb = xgb_model.predict_proba(x_live.reshape(1, -1))[0]
     probs_tf = None
     if tf_payload is not None:
@@ -396,11 +430,17 @@ def get_latest_feature_vector_and_prediction(
         probs = probs_xgb
         agreement = True
 
-    direction = int(np.array([-1, 0, 1])[int(np.argmax(probs))])
-    confidence = float(np.max(probs))
-    require_agreement = bool(ensemble_cfg.get("require_model_agreement", False))
-    is_confirmed = agreement or (not require_agreement)
-    action = direction if confidence >= confidence_threshold and is_confirmed else 0
+    if force_continuous_trade:
+        direction = int(1 if probs[2] >= probs[0] else -1)
+        confidence = float(max(probs[0], probs[2]))
+        is_confirmed = True
+        action = direction
+    else:
+        direction = int(np.array([-1, 0, 1])[int(np.argmax(probs))])
+        confidence = float(np.max(probs))
+        require_agreement = bool(ensemble_cfg.get("require_model_agreement", False))
+        is_confirmed = agreement or (not require_agreement)
+        action = direction if confidence >= confidence_threshold and is_confirmed else 0
 
     return {
         "timestamp": str(latest["close_time"]),
@@ -412,6 +452,7 @@ def get_latest_feature_vector_and_prediction(
         "confidence": confidence,
         "action": action,
         "is_confirmed": bool(is_confirmed),
+        "force_continuous_trade": bool(force_continuous_trade),
         "prob_xgb": probs_xgb.tolist(),
         "prob_transformer": probs_tf.tolist() if probs_tf is not None else None,
         "eval_summary": artifact.get("eval_summary", {}),
@@ -439,6 +480,7 @@ def upgrade_data_and_retrain(
     transformer_epochs: int = DEFAULT_TRANSFORMER_EPOCHS,
     ensemble_weight_xgb: float = DEFAULT_ENSEMBLE_WEIGHT_XGB,
     require_model_agreement: bool = DEFAULT_REQUIRE_MODEL_AGREEMENT,
+    force_continuous_trade: bool = DEFAULT_FORCE_CONTINUOUS_TRADE,
     verbose: bool = False,
 ) -> Dict:
     merged_df, update_stats = update_30s_dataset(
@@ -465,6 +507,7 @@ def upgrade_data_and_retrain(
         transformer_epochs=transformer_epochs,
         ensemble_weight_xgb=ensemble_weight_xgb,
         require_model_agreement=require_model_agreement,
+        force_continuous_trade=force_continuous_trade,
         verbose=verbose,
     )
     joblib.dump(artifact, model_output)

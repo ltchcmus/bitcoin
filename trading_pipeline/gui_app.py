@@ -8,8 +8,10 @@ from trading_pipeline.config import (
     DEFAULT_ENSEMBLE_WEIGHT_XGB,
     DEFAULT_ENABLE_DEPTH_FEATURES,
     DEFAULT_ENABLE_FUTURES_FEATURES,
+    DEFAULT_FORCE_CONTINUOUS_TRADE,
     DEFAULT_LOOKBACK_DAYS,
     DEFAULT_MODEL_FILENAME,
+    DEFAULT_PREDICT_LOOKBACK_MINUTES,
     DEFAULT_REQUIRE_MODEL_AGREEMENT,
     DEFAULT_SYMBOL,
     DEFAULT_TRANSFORMER_EPOCHS,
@@ -39,7 +41,7 @@ class TradingGUI:
         self.threshold_var = tk.StringVar(value=str(DEFAULT_THRESHOLD_30S))
         self.confidence_var = tk.StringVar(value=str(DEFAULT_CONFIDENCE))
         self.fee_var = tk.StringVar(value="0.0004")
-        self.lookback_var = tk.StringVar(value="360")
+        self.lookback_var = tk.StringVar(value=str(DEFAULT_PREDICT_LOOKBACK_MINUTES))
         self.tune_trials_var = tk.StringVar(value=str(DEFAULT_TUNE_TRIALS))
         self.transformer_seq_len_var = tk.StringVar(
             value=str(DEFAULT_TRANSFORMER_SEQ_LEN)
@@ -57,6 +59,9 @@ class TradingGUI:
             value=DEFAULT_REQUIRE_MODEL_AGREEMENT
         )
         self.use_gpu_var = tk.BooleanVar(value=DEFAULT_USE_GPU)
+        self.force_continuous_trade_var = tk.BooleanVar(
+            value=DEFAULT_FORCE_CONTINUOUS_TRADE
+        )
 
         self._build_layout()
 
@@ -167,6 +172,12 @@ class TradingGUI:
             variable=self.use_gpu_var,
         ).grid(row=5, column=0, sticky=tk.W, padx=4, pady=4)
 
+        ttk.Checkbutton(
+            controls,
+            text="Force continuous trade",
+            variable=self.force_continuous_trade_var,
+        ).grid(row=5, column=1, sticky=tk.W, padx=4, pady=4)
+
         ttk.Label(controls, text="Transformer seq len").grid(
             row=4, column=0, sticky=tk.W, padx=4, pady=4
         )
@@ -230,6 +241,7 @@ class TradingGUI:
             "use_transformer": bool(self.use_transformer_var.get()),
             "require_model_agreement": bool(self.require_agreement_var.get()),
             "use_gpu": bool(self.use_gpu_var.get()),
+            "force_continuous_trade": bool(self.force_continuous_trade_var.get()),
         }
 
     def _predict_clicked(self) -> None:
@@ -244,39 +256,21 @@ class TradingGUI:
                     include_futures_features=cfg["include_futures"],
                     include_depth_features=cfg["include_depth"],
                     use_gpu=cfg["use_gpu"],
+                    force_continuous_trade=cfg["force_continuous_trade"],
+                )
+                side = (
+                    "BUY"
+                    if result["action"] > 0
+                    else ("SELL" if result["action"] < 0 else "HOLD")
+                )
+                side_prob = max(
+                    float(result.get("prob_up", 0.0)),
+                    float(result.get("prob_down", 0.0)),
                 )
                 self._log(
-                    f"[Predict] ts={result['timestamp']} close={result['close']:.2f} "
-                    f"down={result['prob_down']:.3f} flat={result['prob_flat']:.3f} up={result['prob_up']:.3f} "
-                    f"conf={result['confidence']:.3f} action={result['action']}"
+                    f"[Predict] {side} {side_prob*100:.2f}% | "
+                    f"price={result['close']:.2f} ts={result['timestamp']}"
                 )
-                self._log(f"[Predict] confirmed={result.get('is_confirmed', False)}")
-
-                px = result.get("prob_xgb")
-                if px is not None:
-                    self._log(
-                        f"[Predict] XGB probs: down={px[0]:.3f} flat={px[1]:.3f} up={px[2]:.3f}"
-                    )
-
-                pt = result.get("prob_transformer")
-                if pt is not None:
-                    self._log(
-                        f"[Predict] Transformer probs: down={pt[0]:.3f} flat={pt[1]:.3f} up={pt[2]:.3f}"
-                    )
-
-                eval_summary = result.get("eval_summary", {})
-                cls_metrics = eval_summary.get("classification_metrics", {})
-                if cls_metrics:
-                    acc = float(cls_metrics.get("accuracy", 0.0)) * 100.0
-                    bacc = float(cls_metrics.get("balanced_accuracy", 0.0)) * 100.0
-                    f1m = float(cls_metrics.get("f1_macro", 0.0)) * 100.0
-                    self._log(
-                        f"[Predict] Historical test: accuracy={acc:.2f}% balanced_acc={bacc:.2f}% f1_macro={f1m:.2f}%"
-                    )
-
-                fv = result["feature_vector"]
-                preview = ", ".join([f"{k}={v:.5f}" for k, v in list(fv.items())[:8]])
-                self._log(f"[Predict] feature_vector_preview: {preview}")
             except Exception as exc:
                 self._log(f"[Predict][Error] {exc}")
 
@@ -306,6 +300,7 @@ class TradingGUI:
                     transformer_epochs=cfg["transformer_epochs"],
                     ensemble_weight_xgb=cfg["ensemble_weight_xgb"],
                     require_model_agreement=cfg["require_model_agreement"],
+                    force_continuous_trade=cfg["force_continuous_trade"],
                 )
                 update = result["update"]
                 train = result["train"]

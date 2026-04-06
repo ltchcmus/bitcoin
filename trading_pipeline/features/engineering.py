@@ -7,10 +7,10 @@ import pandas as pd
 def add_features(df: pd.DataFrame) -> pd.DataFrame:
     feat = df.copy()
 
-    feat["return_30s"] = feat["close"].pct_change()
-    feat["return_2m"] = feat["close"].pct_change(4)
-    feat["return_5m"] = feat["close"].pct_change(10)
-    feat["return_15m"] = feat["close"].pct_change(30)
+    feat["return_30s"] = feat["close"].pct_change(fill_method=None)
+    feat["return_2m"] = feat["close"].pct_change(4, fill_method=None)
+    feat["return_5m"] = feat["close"].pct_change(10, fill_method=None)
+    feat["return_15m"] = feat["close"].pct_change(30, fill_method=None)
     feat["log_return"] = np.log(feat["close"]).diff()
 
     feat["ema_9"] = feat["close"].ewm(span=9, adjust=False).mean()
@@ -80,13 +80,15 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
 
     if "open_interest" in feat.columns:
         feat["open_interest"] = pd.to_numeric(feat["open_interest"], errors="coerce")
-        feat["oi_change_5m"] = feat["open_interest"].pct_change(10)
+        feat["oi_change_5m"] = feat["open_interest"].pct_change(10, fill_method=None)
 
     if "open_interest_value" in feat.columns:
         feat["open_interest_value"] = pd.to_numeric(
             feat["open_interest_value"], errors="coerce"
         )
-        feat["oi_value_change_5m"] = feat["open_interest_value"].pct_change(10)
+        feat["oi_value_change_5m"] = feat["open_interest_value"].pct_change(
+            10, fill_method=None
+        )
 
     if "taker_buy_sell_ratio" in feat.columns:
         feat["taker_buy_sell_ratio"] = pd.to_numeric(
